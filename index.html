@@ -177,29 +177,75 @@ let asteroids=[], bullets=[], particles=[], powerups=[];
 
 let turretAngle=0;
 let killsSincePowerup=0;
-const POWERUP_THRESHOLD=8;
+/* Kills needed before a power-up spawns, tied to how fast rocks are actually
+   coming in (currentSpawnInterval, updated live each frame) rather than a
+   flat number. That way the threshold naturally correlates to volume: slow
+   early spawn rate = fewer kills needed (so the first power-up doesn't take
+   forever), and the tighter spawn cadence of later rounds raises it back up
+   automatically, keeping the roughly-once-every-N-seconds feel consistent. */
+let currentSpawnInterval=1.1;
+const POWERUP_TARGET_SECONDS=9;
+function currentPowerupThreshold(){
+  const rocksPerSecond=1/currentSpawnInterval;
+  return Math.max(4, Math.min(35, Math.round(rocksPerSecond*POWERUP_TARGET_SECONDS)));
+}
+/* cap simultaneous stacked power-ups so the ship can't accumulate Shield +
+   everything else and become effectively unkillable */
+const MAX_ACTIVE_POWERUPS=2;
 
 const WEAPONS={
   normal:{fireRate:0.34,name:'STANDARD'},
   fast:{fireRate:0.11,name:'RAPID FIRE'},
   shotgun:{fireRate:0.45,name:'SHOTGUN'},
   laser:{fireRate:0.5,name:'LASER'},
-  dual:{fireRate:0.3,name:'DUAL CANNON'}
+  dual:{fireRate:0.3,name:'DUAL CANNON'},
+  shield:{name:'SHIELD'},
+  multiplier:{name:'2X SCORE'}
 };
-let currentWeapon='normal';
-let weaponTimer=0;
-const WEAPON_DURATION=13;
+const POWERUP_TYPES=['fast','shotgun','laser','dual','shield','multiplier'];
+/* activeWeapons: map of type -> seconds remaining. Power-ups stack: collecting a
+   new one adds/refreshes its own timer without clearing the others, so effects
+   combine (e.g. shotgun + dual + laser all firing together). */
+let activeWeapons={};
+const WEAPON_DURATION=7;
 let fireTimer=0;
 
 let elapsed=0;
 let spawnTimer=0;
 const baseSpawnInterval=1.1;
-const baseAsteroidSpeed=58;
+
+/* Persistent across every restart (not reset to baseline on death) so each
+   round is harder than the last: bigger rocks, faster rocks, more of them
+   from the very start. Scaling is capped at MAX_SCALED_ROUND so it plateaus
+   instead of growing forever across a 24/7 stream. */
+let roundNumber=0;
+const MAX_SCALED_ROUND=15;
+let roundSizeMult=1;
+let roundBigBias=0;
+let roundSpawnBonus=0;
+/* Rocks are aimed with a travel-TIME budget rather than a flat pixel speed,
+   so difficulty stays consistent across aspect ratios. A flat speed made
+   rocks arrive far faster on a narrow portrait canvas (edges close to
+   center) than on a wide one, making big multi-hit rocks feel disproportio-
+   nately tougher on reel-format screens since there was less time to land
+   enough shots before impact — this fixes that by targeting a reaction
+   window instead of a speed number. */
+const BASE_TIME_TO_REACH=4.2;
+const MIN_TIME_TO_REACH=1.15;
+function currentTimeToReach(){
+  const elapsedRamp=Math.min(2.0, elapsed*0.03);
+  const roundRamp=Math.min(1.0, Math.max(0,roundNumber-1)*0.07);
+  return Math.max(MIN_TIME_TO_REACH, BASE_TIME_TO_REACH-elapsedRamp-roundRamp);
+}
 
 const shipRadius=22;
 let shipAlive=true;
 let gameOverTimer=0;
 let shakeMag=0;
+/* invulnerability window at the start of every life so the seeded asteroids
+   can't sandwich the ship before it's fired a single shot */
+let spawnGraceTimer=0;
+const SPAWN_GRACE_DURATION=2.5;
 
 const weaponIndicatorEl=document.getElementById('weaponIndicator');
 const scoreValEl=document.getElementById('scoreVal');
@@ -217,8 +263,24 @@ function makeAsteroidPoly(radius){
   }
   return pts;
 }
-function sizeRadius(size){ return size===3?46:size===2?28:16; }
-function sizeHp(size){ return size===3?3:size===2?2:1; }
+function sizeRadius(size){
+  const base= size===3?46:size===2?28:16;
+  return base*roundSizeMult;
+}
+function sizeHp(size){
+  // large rocks get tankier in later rounds too, so bigger doesn't just mean
+  // "bigger hitbox" — they take a bit more punishment as well
+  const bonus = size===3 ? Math.min(3,Math.floor(roundNumber/5)) : 0;
+  return (size===3?3:size===2?2:1)+bonus;
+}
+/* How precisely fresh asteroids aim at the ship. Early in a life (and in
+   early rounds) they're aimed at a wide, wobbly area around the ship so
+   plenty just drift past — as elapsed time in the current life climbs and
+   as rounds accumulate, the aim tightens toward dead-on. */
+function currentAimOffsetRange(){
+  const progress=Math.min(1, elapsed/70 + Math.max(0,roundNumber-1)*0.05);
+  return 260-240*progress; // 260px wobble early -> ~20px (near-direct) later
+}
 
 function spawnAsteroid(size,x,y,vx,vy){
   const radius=sizeRadius(size);
@@ -234,11 +296,14 @@ function spawnAsteroid(size,x,y,vx,vy){
 
   let vvx,vvy;
   if(vx===undefined){
-    const targetX=CX+rand(-120,120);
-    const targetY=CY+rand(-120,120);
-    const ang=Math.atan2(targetY-py,targetX-px);
-    const speed=(baseAsteroidSpeed+elapsed*2.2)*rand(0.8,1.3);
-    vvx=Math.cos(ang)*speed; vvy=Math.sin(ang)*speed;
+    const offsetRange=currentAimOffsetRange();
+    const targetX=CX+rand(-offsetRange,offsetRange);
+    const targetY=CY+rand(-offsetRange,offsetRange);
+    const dx=targetX-px, dy=targetY-py;
+    const travelDist=Math.hypot(dx,dy)||1;
+    const timeToReach=currentTimeToReach()*rand(0.85,1.25);
+    const speed=travelDist/timeToReach;
+    vvx=(dx/travelDist)*speed; vvy=(dy/travelDist)*speed;
   } else { vvx=vx; vvy=vy; }
 
   asteroids.push({
@@ -261,14 +326,19 @@ function breakAsteroid(a){
         Math.cos(ang)*speed+a.vx*0.3, Math.sin(ang)*speed+a.vy*0.3);
     }
   }
-  const pts= a.size===3?15:a.size===2?25:40;
+  const multiplier = activeWeapons.multiplier ? 2 : 1;
+  const pts= (a.size===3?15:a.size===2?25:40)*multiplier;
   score+=pts;
   scoreValEl.textContent=score;
   killsSincePowerup++;
-  if(killsSincePowerup>=POWERUP_THRESHOLD){
+  const activeCount=Object.keys(activeWeapons).length;
+  if(killsSincePowerup>=currentPowerupThreshold() && activeCount<MAX_ACTIVE_POWERUPS){
     killsSincePowerup=0;
     spawnPowerup();
   }
+  // if capped, killsSincePowerup stays at/above threshold so the very next
+  // kill after a power-up expires triggers a new one right away — hits
+  // earned while capped aren't lost, just held until a slot opens up
 }
 
 function spawnParticles(x,y,size){
@@ -286,8 +356,7 @@ function spawnParticles(x,y,size){
 }
 
 function spawnPowerup(){
-  const types=['fast','shotgun','laser','dual'];
-  const type=choice(types);
+  const type=choice(POWERUP_TYPES);
   const edge=Math.floor(rand(0,4));
   let px,py;
   if(edge===0){ px=rand(0,W); py=-30; }
@@ -300,29 +369,41 @@ function spawnPowerup(){
 }
 
 /* ---------------- BULLETS ---------------- */
-function fireWeapon(angle){
-  const speed=520;
-  const type=currentWeapon;
-  playShot(type);
-  if(type==='normal'||type==='fast'){
-    bullets.push({x:CX+Math.cos(angle)*shipRadius,y:CY+Math.sin(angle)*shipRadius,
-      vx:Math.cos(angle)*speed,vy:Math.sin(angle)*speed,life:1.4,r:3.5,color:palette.accent});
-  } else if(type==='shotgun'){
-    for(let i=-2;i<=2;i++){
-      const a=angle+i*0.11;
+/* Fire one "salvo" from a given angle, respecting whichever power-ups are
+   currently stacked: shotgun widens it into a spread, laser makes every
+   bullet in it piercing. Called once for the front, and again for the back
+   if Dual Cannon is active, so combos compound naturally. */
+function fireSalvoFrom(angle,speed){
+  const laserOn=!!activeWeapons.laser;
+  const angles = activeWeapons.shotgun
+    ? [-2,-1,0,1,2].map(i=>angle+i*0.11)
+    : [angle];
+  for(const a of angles){
+    if(laserOn){
+      bullets.push({x:CX+Math.cos(a)*shipRadius,y:CY+Math.sin(a)*shipRadius,
+        vx:Math.cos(a)*speed*1.6,vy:Math.sin(a)*speed*1.6,life:1.0,r:5,
+        color:'#ff5df2',laser:true});
+    } else if(activeWeapons.shotgun){
       bullets.push({x:CX+Math.cos(a)*shipRadius,y:CY+Math.sin(a)*shipRadius,
         vx:Math.cos(a)*speed*0.9,vy:Math.sin(a)*speed*0.9,life:0.9,r:3,color:'#ffcf6b'});
+    } else {
+      bullets.push({x:CX+Math.cos(a)*shipRadius,y:CY+Math.sin(a)*shipRadius,
+        vx:Math.cos(a)*speed,vy:Math.sin(a)*speed,life:1.4,r:3.5,color:palette.accent});
     }
-  } else if(type==='laser'){
-    bullets.push({x:CX+Math.cos(angle)*shipRadius,y:CY+Math.sin(angle)*shipRadius,
-      vx:Math.cos(angle)*speed*1.6,vy:Math.sin(angle)*speed*1.6,life:1.0,r:5,
-      color:'#ff5df2',laser:true});
-  } else if(type==='dual'){
-    bullets.push({x:CX+Math.cos(angle)*shipRadius,y:CY+Math.sin(angle)*shipRadius,
-      vx:Math.cos(angle)*speed,vy:Math.sin(angle)*speed,life:1.4,r:3.5,color:palette.accent});
-    const back=angle+Math.PI;
-    bullets.push({x:CX+Math.cos(back)*shipRadius,y:CY+Math.sin(back)*shipRadius,
-      vx:Math.cos(back)*speed,vy:Math.sin(back)*speed,life:1.4,r:3.5,color:palette.accent});
+  }
+}
+
+function fireWeapon(angle){
+  const speed=520;
+  // representative sound: pick whichever active power-up is "loudest" so
+  // audio doesn't just play the same blip regardless of what's stacked.
+  const soundType = activeWeapons.laser?'laser' : activeWeapons.shotgun?'shotgun' :
+    activeWeapons.fast?'fast' : activeWeapons.dual?'dual' : 'normal';
+  playShot(soundType);
+
+  fireSalvoFrom(angle,speed);
+  if(activeWeapons.dual){
+    fireSalvoFrom(angle+Math.PI,speed);
   }
 }
 
@@ -350,11 +431,25 @@ function resetGame(){
   asteroids=[]; bullets=[]; particles=[]; powerups=[];
   score=0; scoreValEl.textContent='0';
   killsSincePowerup=0;
-  currentWeapon='normal'; weaponTimer=0;
+  activeWeapons={};
   elapsed=0; spawnTimer=0;
   shipAlive=true;
   gameOverEl.style.opacity='0';
-  for(let i=0;i<3;i++) spawnAsteroid(choice([2,3]));
+
+  // each restart is a new, harder round — this never resets to baseline
+  roundNumber++;
+  const effRound=Math.min(roundNumber-1, MAX_SCALED_ROUND);
+  roundSizeMult=1+effRound*0.15;      // rocks get physically bigger each round
+  roundBigBias=effRound*0.04;          // more large rocks appear right away
+  roundSpawnBonus=effRound*0.045;      // spawn cadence starts tighter
+
+  const seedCount=Math.min(2+Math.floor(effRound/2),6);
+  for(let i=0;i<seedCount;i++) spawnAsteroid(choice([1,1,2]));
+
+  // brief spawn-in invulnerability so the ship isn't instantly sandwiched by
+  // the seeded rocks before it's had a chance to start clearing them — this
+  // is what actually gets it far enough to earn its first power-up
+  spawnGraceTimer=SPAWN_GRACE_DURATION;
 }
 
 /* ---------------- MAIN LOOP ---------------- */
@@ -370,12 +465,13 @@ function nearestAsteroid(){
 function update(dt){
   elapsed+=dt;
 
-  const spawnInterval=Math.max(0.28, baseSpawnInterval - elapsed*0.012);
+  const spawnInterval=Math.max(0.24, baseSpawnInterval - roundSpawnBonus - elapsed*0.012);
+  currentSpawnInterval=spawnInterval;
   spawnTimer-=dt;
   if(spawnTimer<=0){
     spawnTimer=spawnInterval;
     const roll=Math.random();
-    const bigChance=Math.min(0.55,0.15+elapsed*0.01);
+    const bigChance=Math.min(0.7,0.15+elapsed*0.01+roundBigBias);
     let size;
     if(roll<bigChance) size=3;
     else if(roll<bigChance+0.3) size=2;
@@ -393,9 +489,10 @@ function update(dt){
     turretAngle+=diff*Math.min(1,dt*18);
   }
 
-  if(currentWeapon!=='normal'){
-    weaponTimer-=dt;
-    if(weaponTimer<=0) currentWeapon='normal';
+  // count down each stacked power-up independently; expire on its own timer
+  for(const type of Object.keys(activeWeapons)){
+    activeWeapons[type]-=dt;
+    if(activeWeapons[type]<=0) delete activeWeapons[type];
   }
 
   fireTimer-=dt;
@@ -406,7 +503,9 @@ function update(dt){
     while(diff<-Math.PI) diff+=Math.PI*2;
     if(Math.abs(diff)<0.3){
       fireWeapon(turretAngle);
-      fireTimer=WEAPONS[currentWeapon].fireRate;
+      // fastest active rate wins so stacking Rapid Fire always speeds things up
+      const rate = activeWeapons.fast ? WEAPONS.fast.fireRate : WEAPONS.normal.fireRate;
+      fireTimer=rate;
     }
   }
 
@@ -435,8 +534,8 @@ function update(dt){
   for(const p of powerups){
     if(dist(p.x,p.y,CX,CY) < shipRadius+18){
       p._collected=true;
-      currentWeapon=p.type;
-      weaponTimer=WEAPON_DURATION;
+      // stack: add/refresh this power-up's own timer without touching others
+      activeWeapons[p.type]=WEAPON_DURATION;
       playPowerup();
     }
   }
@@ -444,7 +543,15 @@ function update(dt){
 
   for(const a of asteroids){
     if(dist(a.x,a.y,CX,CY) < a.radius+shipRadius*0.65){
-      shipHit();
+      if(activeWeapons.shield || spawnGraceTimer>0){
+        // shield/grace absorbs the hit: the rock still shatters (and still
+        // scores/counts toward the next power-up) but the ship survives
+        const idx=asteroids.indexOf(a);
+        breakAsteroid(a);
+        if(idx>-1) asteroids.splice(idx,1);
+      } else {
+        shipHit();
+      }
       break;
     }
   }
@@ -452,9 +559,12 @@ function update(dt){
   updateParticles(dt);
   for(const s of stars){ s.tw+=dt*s.speed; }
   shakeMag*=Math.max(0,1-dt*6);
+  spawnGraceTimer=Math.max(0,spawnGraceTimer-dt);
 
-  weaponIndicatorEl.textContent = currentWeapon==='normal' ? '' :
-    (WEAPONS[currentWeapon].name+'  '+Math.ceil(weaponTimer)+'s');
+  const activeTypes=Object.keys(activeWeapons);
+  weaponIndicatorEl.textContent = activeTypes.length===0 ? '' :
+    activeTypes.map(t=>WEAPONS[t].name+' '+Math.ceil(activeWeapons[t])+'s').join('  ·  ');
+  scoreValEl.style.color = activeWeapons.multiplier ? '#ffd700' : '';
 }
 
 function updateParticles(dt){
@@ -530,7 +640,8 @@ function render(){
     ctx.fillStyle='#fff';
     ctx.font='bold 14px sans-serif';
     ctx.textAlign='center'; ctx.textBaseline='middle';
-    const label= p.type==='fast'?'F': p.type==='shotgun'?'S': p.type==='laser'?'L':'D';
+    const label= p.type==='fast'?'F': p.type==='shotgun'?'S': p.type==='laser'?'L':
+      p.type==='dual'?'D': p.type==='shield'?'H':'X';
     ctx.fillText(label,0,1);
     ctx.restore();
   }
@@ -546,24 +657,149 @@ function render(){
     ctx.globalAlpha=1;
   }
 
-  if(shipAlive){
+  if(shipAlive) drawShip();
+
+  ctx.restore();
+}
+
+function shipTint(){
+  if(activeWeapons.laser) return '#ff5df2';
+  if(activeWeapons.shotgun) return '#ffcf6b';
+  return palette.accent;
+}
+
+function drawThruster(cx,cy,scale,tint,t){
+  const flick = 0.75+0.25*Math.sin(t*26)+0.15*Math.sin(t*53+1.7);
+  const len = shipRadius*0.9*scale*flick;
+  const w = shipRadius*0.32*scale;
+  ctx.save();
+  ctx.globalCompositeOperation='lighter';
+  const grad=ctx.createLinearGradient(cx,0,cx-len,0);
+  grad.addColorStop(0, tint+'ff');
+  grad.addColorStop(0.5, tint+'88');
+  grad.addColorStop(1, tint+'00');
+  ctx.fillStyle=grad;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy-w*0.5);
+  ctx.lineTo(cx-len, cy);
+  ctx.lineTo(cx, cy+w*0.5);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawShip(){
+  const t=performance.now()/1000;
+  const tint=shipTint();
+  const r=shipRadius;
+
+  ctx.save();
+  ctx.translate(CX,CY);
+  ctx.rotate(turretAngle);
+
+  // ambient halo so the ship pops against the starfield
+  const haloR=r*2.4;
+  const halo=ctx.createRadialGradient(0,0,r*0.4,0,0,haloR);
+  halo.addColorStop(0,tint+'40');
+  halo.addColorStop(1,tint+'00');
+  ctx.fillStyle=halo;
+  ctx.beginPath(); ctx.arc(0,0,haloR,0,Math.PI*2); ctx.fill();
+
+  // main rear thruster (always on), plus a mirrored nose thruster if Dual
+  // Cannon is stacked, so the rear-firing gun reads visually
+  drawThruster(-r*0.5,0,1,tint,t);
+  if(activeWeapons.dual) drawThruster(-r*0.95,0,0.6,tint,t+0.4);
+
+  // hull: swept delta-wing fighter with a concave tail notch
+  ctx.beginPath();
+  ctx.moveTo(r*1.25,0);
+  ctx.quadraticCurveTo(r*0.35,r*0.22, r*0.05,r*0.32);
+  ctx.lineTo(-r*0.15,r*1.05);
+  ctx.lineTo(-r*0.5,r*0.5);
+  ctx.quadraticCurveTo(-r*0.62,r*0.14,-r*0.35,0);
+  ctx.quadraticCurveTo(-r*0.62,-r*0.14,-r*0.5,-r*0.5);
+  ctx.lineTo(-r*0.15,-r*1.05);
+  ctx.lineTo(r*0.05,-r*0.32);
+  ctx.quadraticCurveTo(r*0.35,-r*0.22, r*1.25,0);
+  ctx.closePath();
+
+  const hullGrad=ctx.createLinearGradient(-r,0,r*1.25,0);
+  hullGrad.addColorStop(0,'#5a6b80');
+  hullGrad.addColorStop(0.55,'#eef4fa');
+  hullGrad.addColorStop(1,'#c7d6e6');
+  ctx.fillStyle=hullGrad;
+  ctx.strokeStyle=tint;
+  ctx.lineWidth=2;
+  ctx.shadowColor=tint;
+  ctx.shadowBlur=10;
+  ctx.fill();
+  ctx.shadowBlur=0;
+  ctx.stroke();
+
+  // center spine line for a bit of hull detail
+  ctx.strokeStyle='rgba(0,0,0,0.18)';
+  ctx.lineWidth=1.2;
+  ctx.beginPath();
+  ctx.moveTo(r*1.05,0);
+  ctx.lineTo(-r*0.25,0);
+  ctx.stroke();
+
+  // cockpit glow
+  const cockpitPulse=0.8+0.2*Math.sin(t*3);
+  ctx.save();
+  ctx.globalCompositeOperation='lighter';
+  const cg=ctx.createRadialGradient(r*0.55,0,0,r*0.55,0,r*0.24);
+  cg.addColorStop(0, tint);
+  cg.addColorStop(1, tint+'00');
+  ctx.fillStyle=cg;
+  ctx.globalAlpha=cockpitPulse;
+  ctx.beginPath(); ctx.arc(r*0.55,0,r*0.24,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+  ctx.fillStyle='#ffffff';
+  ctx.beginPath(); ctx.arc(r*0.55,0,r*0.1,0,Math.PI*2); ctx.fill();
+
+  // wingtip nav lights, blinking slightly out of phase
+  for(const s of [1,-1]){
+    const blink=0.5+0.5*Math.sin(t*5 + (s>0?0:Math.PI));
     ctx.save();
-    ctx.translate(CX,CY);
-    ctx.rotate(turretAngle);
+    ctx.globalCompositeOperation='lighter';
+    ctx.globalAlpha=0.5+0.5*blink;
+    ctx.fillStyle=tint;
     ctx.beginPath();
-    ctx.moveTo(shipRadius,0);
-    ctx.lineTo(-shipRadius*0.7,shipRadius*0.75);
-    ctx.lineTo(-shipRadius*0.35,0);
-    ctx.lineTo(-shipRadius*0.7,-shipRadius*0.75);
-    ctx.closePath();
-    ctx.fillStyle='#e8f6ff';
-    ctx.strokeStyle=palette.accent;
+    ctx.arc(-r*0.15,s*r*1.05,3.2,0,Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // shield bubble: clear visual feedback that a collision won't be fatal
+  if(activeWeapons.shield){
+    const pulse=0.55+0.25*Math.sin(t*6);
+    ctx.save();
+    ctx.strokeStyle='#4dd2ff';
+    ctx.lineWidth=2.5;
+    ctx.globalAlpha=pulse;
+    ctx.shadowColor='#4dd2ff';
+    ctx.shadowBlur=12;
+    ctx.beginPath();
+    ctx.arc(0,0,r*1.7,0,Math.PI*2);
+    ctx.stroke();
+    ctx.shadowBlur=0;
+    ctx.restore();
+  }
+
+  // spawn-grace ring: dashed white pulse, distinct from the Shield power-up,
+  // shown only during the brief invulnerability window at the start of a life
+  if(spawnGraceTimer>0){
+    const pulse=0.5+0.3*Math.sin(t*10);
+    ctx.save();
+    ctx.strokeStyle='#ffffff';
     ctx.lineWidth=2;
-    ctx.fill(); ctx.stroke();
+    ctx.globalAlpha=Math.min(1,spawnGraceTimer)*pulse;
+    ctx.setLineDash([6,5]);
     ctx.beginPath();
-    ctx.arc(-shipRadius*0.5,0,5+2*Math.sin(performance.now()/60),0,Math.PI*2);
-    ctx.fillStyle=palette.accent;
-    ctx.globalAlpha=0.8; ctx.fill(); ctx.globalAlpha=1;
+    ctx.arc(0,0,r*1.9,0,Math.PI*2);
+    ctx.stroke();
+    ctx.setLineDash([]);
     ctx.restore();
   }
 

@@ -214,12 +214,9 @@ let elapsed=0;
 let spawnTimer=0;
 const baseSpawnInterval=1.1;
 
-/* Persistent across every restart (not reset to baseline on death) so each
-   round is harder than the last: bigger rocks, faster rocks, more of them
-   from the very start. Scaling is capped at MAX_SCALED_ROUND so it plateaus
-   instead of growing forever across a 24/7 stream. */
-let roundNumber=0;
-const MAX_SCALED_ROUND=15;
+/* Difficulty ramps up WITHIN a single life (via elapsed time below) but no
+   longer persists across restarts — every new life starts back at baseline
+   after a game over, rather than compounding across deaths. */
 let roundSizeMult=1;
 let roundBigBias=0;
 let roundSpawnBonus=0;
@@ -234,8 +231,7 @@ const BASE_TIME_TO_REACH=4.2;
 const MIN_TIME_TO_REACH=1.15;
 function currentTimeToReach(){
   const elapsedRamp=Math.min(2.0, elapsed*0.03);
-  const roundRamp=Math.min(1.0, Math.max(0,roundNumber-1)*0.07);
-  return Math.max(MIN_TIME_TO_REACH, BASE_TIME_TO_REACH-elapsedRamp-roundRamp);
+  return Math.max(MIN_TIME_TO_REACH, BASE_TIME_TO_REACH-elapsedRamp);
 }
 
 const shipRadius=22;
@@ -268,17 +264,14 @@ function sizeRadius(size){
   return base*roundSizeMult;
 }
 function sizeHp(size){
-  // large rocks get tankier in later rounds too, so bigger doesn't just mean
-  // "bigger hitbox" — they take a bit more punishment as well
-  const bonus = size===3 ? Math.min(3,Math.floor(roundNumber/5)) : 0;
-  return (size===3?3:size===2?2:1)+bonus;
+  return size===3?3:size===2?2:1;
 }
-/* How precisely fresh asteroids aim at the ship. Early in a life (and in
-   early rounds) they're aimed at a wide, wobbly area around the ship so
-   plenty just drift past — as elapsed time in the current life climbs and
-   as rounds accumulate, the aim tightens toward dead-on. */
+/* How precisely fresh asteroids aim at the ship. Early in a life they're
+   aimed at a wide, wobbly area around the ship so plenty just drift past —
+   as elapsed time in the current life climbs, the aim tightens toward
+   dead-on. Resets to wide/wobbly again at the start of every new life. */
 function currentAimOffsetRange(){
-  const progress=Math.min(1, elapsed/70 + Math.max(0,roundNumber-1)*0.05);
+  const progress=Math.min(1, elapsed/70);
   return 260-240*progress; // 260px wobble early -> ~20px (near-direct) later
 }
 
@@ -436,14 +429,14 @@ function resetGame(){
   shipAlive=true;
   gameOverEl.style.opacity='0';
 
-  // each restart is a new, harder round — this never resets to baseline
-  roundNumber++;
-  const effRound=Math.min(roundNumber-1, MAX_SCALED_ROUND);
-  roundSizeMult=1+effRound*0.15;      // rocks get physically bigger each round
-  roundBigBias=effRound*0.04;          // more large rocks appear right away
-  roundSpawnBonus=effRound*0.045;      // spawn cadence starts tighter
+  // every life starts fresh at baseline now — difficulty still ramps up
+  // WITHIN a life via elapsed time, it just no longer carries over to the
+  // next life after a game over
+  roundSizeMult=1;
+  roundBigBias=0;
+  roundSpawnBonus=0;
 
-  const seedCount=Math.min(2+Math.floor(effRound/2),6);
+  const seedCount=2;
   for(let i=0;i<seedCount;i++) spawnAsteroid(choice([1,1,2]));
 
   // brief spawn-in invulnerability so the ship isn't instantly sandwiched by
